@@ -4,6 +4,7 @@ emoji: "✨"
 type: "tech" # tech: 技術記事 / idea: アイデア
 topics: [AWS]
 published: false
+publication: "digeon"
 ---
 
 ## 1. なぜPresigned URLを選んだのか（設計判断）
