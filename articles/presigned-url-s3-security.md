@@ -21,8 +21,6 @@ publication_name: "digeon"
 :::message
 **プロキシ型とは**
 ブラウザが送った画像バイナリをサーバーが一度受け取り、そのままS3へ転送する方式です。サーバーが「中継役（プロキシ）」となるため、同じバイナリがブラウザ→サーバー→S3と2回ネットワークを流れます。
-
-なお、プロキシ型が常に悪いわけではありません。サーバーを経由することでアップロード前にウイルススキャンや画像リサイズといったサーバーサイド処理を挟めること、監査ログをサーバー側で確実に記録できることが利点として挙げられます。要件によっては意図してこの方式を選ぶケースもあります。
 :::
 
 しかしこの方式には構造的な無駄があります。バックエンドが画像のバイナリを中継するため、同じデータがブラウザ→バックエンド→S3と2回転送されます。同時アップロードが増えるほどバックエンドのCPUと帯域を消費し、バックエンド自体が処理のボトルネックになってしまいます。（CPU＝料金所での審査処理、帯域＝道幅の広さ、で理解してます）
@@ -33,9 +31,21 @@ publication_name: "digeon"
 
 :::message
 **SSRFとは**
-悪意あるユーザーが内部のエンドポイントが閲覧できる権限を持つサーバーを踏み台にし、本来閲覧できないIAM認証情報などを盗みとる攻撃です。プロキシ型では①URL検証②ネットワーク隔離③IMDSv2強制の三層で防ぐ必要がありますが、Presigned URL方式はユーザー指定のURLをfetchする仕組み自体を持たないため、引き金となる機能が存在せずシンプルに防ぐことができます。
+悪意あるユーザーが指定したURLをサーバーが内部でfetchする設計があると、そのサーバーを踏み台にして本来閲覧できないIAM認証情報などを盗みとられる攻撃です。ユーザー指定URLをサーバーがfetchする設計では①URL検証②ネットワーク隔離③IMDSv2強制の三層で防ぐ必要がありますが、Presigned URL方式はそもそもユーザー指定のURLをfetchする仕組みを持たないため、引き金となる機能が存在せずシンプルに防ぐことができます。
+
 最初SSRFと聞いたとき何を言っているのかわかりませんでした。セキュリティの攻撃名称ってむずかしいアルファベットが多くて困ります。（XSSとか...）
 :::
+
+:::message
+**IMDSv2とは**
+EC2インスタンスが自身のメタデータ（IAMロールの一時認証情報など）を取得するためのAWS内部APIです。旧バージョン（IMDSv1）は `http://169.254.169.254/` へのシンプルなGETリクエストだけでアクセスできたため、SSRF攻撃でサーバーにそのURLをfetchさせるだけでIAM認証情報を盗めてしまいました。
+
+IMDSv2（v2）ではセッショントークン方式に変わり、メタデータ取得の前にPUTリクエストでトークンを先に発行する必要があります。SSRFはGETリクエストを誘発する攻撃であるためPUTが発行できず、IMDSv2を強制することでメタデータへの到達を防ぐことができます。
+:::
+
+
+なお、プロキシ型が常に悪いわけではありません。サーバーを経由することでアップロード前にウイルススキャンや画像リサイズといったサーバーサイド処理を挟めること、監査ログをサーバー側で確実に記録できることが利点として挙げられます。要件によっては意図してこの方式を選ぶケースもあるらしいです。
+
 
 参考: [Amazon S3 署名付きURLについて](https://docs.aws.amazon.com/ja_jp/AmazonS3/latest/userguide/using-presigned-url.html) / [OWASP: SSRF](https://owasp.org/Top10/2021/ja/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/)
 
@@ -55,18 +65,18 @@ publication_name: "digeon"
 
 **App Server** はコントロールタワーの役割を担います。JWTによる認証・認可、Presigned URLの発行、DBへのメタデータの永続化を行います。画像のバイナリ本体には一切触れず、「誰が・何を・どこに置くか」の管理だけを担当します。
 
-**S3** はバイナリデータの保管庫です。ブラウザから直接PUTされたファイルを受け取り、URLに埋め込まれた署名をIAMの秘密鍵で再計算・照合することで、App Serverが正規に発行したリクエストかどうかを検証します。
+**S3** はバイナリデータの保管庫です。ブラウザから直接PUTされたファイルを受け取り、URLに埋め込まれた署名をAWS認証情報（secret access keyまたは一時認証情報）でSigV4再計算・照合することで、App Serverが正規に発行したリクエストかどうかを検証します。
 
-![三者の役割分担](/images/three_party_roles-v3.png)
+![三者の役割分担](/images/upload_swimlane_plain.png)
 
 参考: [Securing Amazon S3 presigned URLs for serverless applications](https://aws.amazon.com/blogs/compute/securing-amazon-s3-presigned-urls-for-serverless-applications)
 
-## 3. 秘密鍵による署名の仕組み
+## 3. Secret access keyによる署名の仕組み
 
-調べていると、秘密鍵というワードが目につきました。どうやら通信の安全性を担保するためのブラウザ⇔App Server間のJWT認証と同じように、ブラウザ⇔S3間でも秘密鍵による署名によってデータの出どころの安全性を担保していると分かりました。
+調べていると、secret access keyというワードが目につきました。どうやら認証・認可のためのブラウザ⇔App Server間のJWT認証と同じように、ブラウザ⇔S3間でもsecret access keyによる署名によって特定のS3操作を期限付きで認可していることがわかります。
 以下、調べた内容となっています。
 
-Presigned URLの中核にあるのは **HMAC-SHA256** という署名アルゴリズムです。App ServerはPresigned URLを生成するとき、IAMの秘密鍵を使って「HTTPメソッド・対象のS3キー・有効期限・発行日時」を材料にHMAC-SHA256でハッシュ値を計算します。この値が署名本体であり、URLのクエリパラメータとして材料とともに埋め込まれます。
+Presigned URLの中核にあるのは **HMAC-SHA256** という署名アルゴリズムです。App ServerはPresigned URLを生成するとき、AWS認証情報（secret access keyまたは一時認証情報）を使って「HTTPメソッド・対象のS3キー・有効期限・発行日時」を材料にHMAC-SHA256でハッシュ値を計算します。この値が署名本体であり、URLのクエリパラメータとして材料とともに埋め込まれます。
 
 ```
 https://s3.amazonaws.com/app-images-prod/uploads/user-1/abc.jpg
@@ -75,9 +85,9 @@ https://s3.amazonaws.com/app-images-prod/uploads/user-1/abc.jpg
   &X-Amz-Signature=a3f9b2c1...  ← 署名本体
 ```
 
-ブラウザはこのURLをそのまま使ってS3へのPUTリクエストを送ります。S3はリクエストを受け取ると、URLから材料を取り出し、同じIAM秘密鍵で署名を再計算して、値が一致すれば「App Serverが正規に発行したリクエスト」としてアクセスを許可します。
+ブラウザはこのURLをそのまま使ってS3へのPUTリクエストを送ります。S3はリクエストを受け取ると、URLから材料を取り出し、同じAWS認証情報でSigV4署名を再計算して、値が一致すれば「App Serverが正規に発行したリクエスト」としてアクセスを許可します。
 
-この仕組みの重要な点は、秘密鍵がApp ServerとAWSの間だけに存在することです。ブラウザは秘密鍵を持たないためURLを改ざんしても正しい署名を作れず、対象キーを一文字でも書き換えれば再計算した署名が食い違い、S3に即座に拒否されます。
+この仕組みの重要な点は、secret access key（またはIAMロールが発行した一時認証情報）がApp ServerとAWSの間だけに存在することです。ブラウザはその認証情報を持たないためURLを改ざんしても正しい署名を作れず、対象キーを一文字でも書き換えれば再計算した署名が食い違い、S3に即座に拒否されます。
 
 （署名については高校の情報の授業で触れていたので、アハ体験でした...）
 
@@ -102,7 +112,16 @@ JWTのuser_idとDBのuser_idを照合して「誰がどのリソースを操作�
 
 ### 第3層：バケットポリシーでのバリデーション
 
-S3のバケットポリシーで許可するContent-Typeのホワイトリストを定義し、ポリシーレベルで不正なリクエストを拒否します。
+Presigned URL生成時にContent-Typeを署名対象に含めることで、指定外のContent-TypeでのリクエストをS3の署名検証段階で拒否します。Presigned POSTを使う場合はポリシー条件にContent-Typeを明示的に列挙できます。
+
+:::message
+**Content-Typeホワイトリストの実装について**
+S3バケットポリシーの条件キー（`s3:x-amz-storage-class` など）にはContent-Typeを直接フィルタするキーが存在しません。今回の要件におけるPresigned PUT URL方式でのContent-Type制御は、App ServerがURL生成時に `ContentType` パラメータを指定することで実現させようとしています。S3はアップロード時に署名と一致するContent-Typeヘッダーを要求し、不一致のリクエストを署名検証の段階で拒否します。
+
+なお、Presigned POSTを使う方式では、S3 POST Policyの条件として `["eq", "$Content-Type", "image/jpeg"]` のようにContent-Typeを明示的に列挙することが公式に定義されています。
+
+参考: [バケットポリシーの条件キー例](https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazon-s3-policy-keys.html) / [Amazon S3 POST Policy](https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html)
+:::
 
 :::message alert
 **第1〜3層の共通の限界**
@@ -120,7 +139,13 @@ S3に保存されたファイルのバイナリ本体を直接読み、先頭数
 - JPEGなら必ず `FF D8 FF` で始まる
 - PNGなら必ず `89 50 4E 47` で始まる
 
-Content-Typeを偽装したファイルや、ポリグロット形式（複数のフォーマットとして解釈できるファイル）を検出するのがこの層の役割です。申告された文字列を一切信用せず、ファイルの実態だけで判定するため、全ての層をすり抜けた偽装に対する最終的な砦となります。
+Content-Typeを偽装したファイルや、ポリグロット形式（複数のフォーマットとして解釈できるファイル）を検出するのがこの層の役割としています。
+
+ちなみに、以下Claudeによる補足となっています。
+
+> *Claude による補足*
+> 申告された文字列を一切信用せずファイルの実態で判定する点で前の層より強力ですが、マジックバイト検証だけで完全な防御を保証できるわけではありません。デコード・再エンコードによる検証や、検証が完了するまで配信しない設計と組み合わせることで、セキュリティ性に優れた設計を実現する...
+セキュリティって奥が深いですね。
 
 ---
 
@@ -150,7 +175,7 @@ Content-Typeを偽装したファイルや、ポリグロット形式（複数�
 今回、最も理解に苦しんだのは **IAMとHMAC（署名）の違い** です。
 
 - **IAMロール** ：バックエンドがS3にPUTする権限を持つ根拠。AWSはそのロールに基づいて一時的な認証情報を自動で発行する。効くのは「AWSを操作する主体（バックエンド）」に対してであって、アプリのエンドユーザーには効かない。
-- **署名（HMAC）** ：IAMロールの権限を材料にして作成される。バックエンドはPUT・キー・期限・サイズ条件をもとにHMAC計算を実行し、その結果をURLに埋め込む。第三者がそのURLを使うとき、IAMは登場しない。
+- **署名（HMAC）** ：IAMロールの権限を材料にして作成される。バックエンドはPUT・キー・期限・サイズ条件をもとにHMAC計算を実行し、その結果をURLに埋め込む。URLを持つ人は期限内に使えるが、許可される操作の範囲は発行元のIAM権限に制限される。
 
 整理するとこうなります。
 
@@ -158,7 +183,7 @@ Content-Typeを偽装したファイルや、ポリグロット形式（複数�
 > **署名** は「その権限から切り出した、特定操作だけを許す使い捨ての許可証」
 > 作るのはバックエンド、検証するのはS3
 
-セキュリティやエラーハンドリングは様々なケースが想定され、詳細設計で必要十分を追い求めることの難しさを感じました。特に状態機械についてはこの場合まだまだ考慮の余地があり、安全性を優先するか速度を優先するかで遷移する状態が変わってきます。また、エラーハンドリングについてはここに取り上げていない内容で定義しないといけないこと、判断しないといけないことが山のようにあります。圧倒されそうです...
+セキュリティやエラーハンドリングは様々なケースが想定され、詳細設計で必要十分を追い求めることの難しさを感じました。特に状態遷移についてはこの場合まだまだ考慮の余地があり、安全性を優先するか速度を優先するかで遷移する状態が変わってきます。また、エラーハンドリングについてはここに取り上げていない内容で定義しないといけないこと、判断しないといけないことが山のようにあります。圧倒されそうです...
 AIはそれらしい設計をたくさん出してくれますが、その妥当性を自身で判断できるようになれるよう、これからも積極的に学んでいこうと思います。
 
 ## 参考資料（まとめたもの）
@@ -167,5 +192,6 @@ AIはそれらしい設計をたくさん出してくれますが、その妥当
 - [Amazon S3 署名付きURL](https://docs.aws.amazon.com/ja_jp/AmazonS3/latest/userguide/using-presigned-url.html)
 - [Securing Amazon S3 presigned URLs for serverless applications](https://aws.amazon.com/blogs/compute/securing-amazon-s3-presigned-urls-for-serverless-applications)
 - [署名バージョン4 - AWS](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv.html)
+- [Amazon S3 POST Policy（Content-Type条件キーの公式定義）](https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html)
 - [OWASP: Server-Side Request Forgery (SSRF)](https://owasp.org/Top10/2021/ja/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/)
 - [OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html)
